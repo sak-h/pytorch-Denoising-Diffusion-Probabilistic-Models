@@ -1,10 +1,11 @@
 import math
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 class Unet(nn.Module):
-    def __init__(self, input_nc, output_nc, num_middles=2, ngf=64, use_dropout=False, device='cpu'):
+    def __init__(self, input_nc, output_nc, num_middles=2, ngf=64, use_dropout=False, use_attention=False, device='cpu'):
         """Create a Unet Module
 
         Parameters:
@@ -18,13 +19,13 @@ class Unet(nn.Module):
         """
         super(Unet, self).__init__()
         # construct unet structure
-        unet_block = UnetSkipModule(ngf * 8, ngf * 8, ngf * 4, input_nc=None, submodule=None, innermost=True, use_dropout=use_dropout)  # add the innermost layer
+        unet_block = UnetSkipModule(ngf * 8, ngf * 8, ngf * 4, input_nc=None, submodule=None, innermost=True, use_dropout=use_dropout, use_attention=use_attention)  # add the innermost layer
         for i in range(num_middles):          # add intermediate layers with ngf * 8 filters
-            unet_block = UnetSkipModule(ngf * 8, ngf * 8, ngf * 4, input_nc=None, submodule=unet_block, use_dropout=use_dropout)
+            unet_block = UnetSkipModule(ngf * 8, ngf * 8, ngf * 4, input_nc=None, submodule=unet_block, use_dropout=use_dropout, use_attention=use_attention)
         # gradually reduce the number of filters from ngf * 8 to ngf
-        unet_block = UnetSkipModule(ngf * 4, ngf * 8, ngf * 4, input_nc=None, submodule=unet_block, use_dropout=use_dropout)
-        unet_block = UnetSkipModule(ngf * 2, ngf * 4, ngf * 4, input_nc=None, submodule=unet_block, use_dropout=use_dropout)
-        unet_block = UnetSkipModule(ngf, ngf * 2, ngf * 4, input_nc=None, submodule=unet_block, use_dropout=use_dropout)
+        unet_block = UnetSkipModule(ngf * 4, ngf * 8, ngf * 4, input_nc=None, submodule=unet_block, use_dropout=use_dropout, use_attention=use_attention)
+        unet_block = UnetSkipModule(ngf * 2, ngf * 4, ngf * 4, input_nc=None, submodule=unet_block, use_dropout=use_dropout, use_attention=use_attention)
+        unet_block = UnetSkipModule(ngf, ngf * 2, ngf * 4, input_nc=None, submodule=unet_block, use_dropout=use_dropout, use_attention=use_attention)
         self.model = UnetSkipModule(output_nc, ngf, ngf * 4, input_nc=input_nc, submodule=unet_block, outermost=True, use_dropout=use_dropout)  # add the outermost layer
 
         self.embedding_weight = torch.exp(torch.arange(0, ngf//2) * -(math.log(10000) / (ngf//2 - 1))).to(device)
@@ -67,17 +68,23 @@ class UnetSkipModule(nn.Module):
                 nn.ConvTranspose2d(inner_nc * 2, outer_nc, kernel_size=3, stride=1, padding=1, padding_mode='zeros')
                 ))
         elif innermost:
-            self.down = nn.Sequential(
-                ResnetBlock(input_nc, emb_nc, 3, use_dropout),
+            model = [ResnetBlock(input_nc, emb_nc, 3, use_dropout)]
+            if use_attention:
+                model += [AttentionBlock(input_nc, enable_resolutions=[16])]
+            model += [
                 nn.BatchNorm2d(num_features=input_nc),
                 nn.ReLU(),
                 nn.Conv2d(input_nc, inner_nc, kernel_size=3, stride=1, padding=1, padding_mode='reflect')
-                )
-            self.up = ResnetBlock(inner_nc, emb_nc, 3, use_dropout)
+                ]
+            self.down = nn.Sequential(*model)
+            model = [ResnetBlock(inner_nc, emb_nc, 3, use_dropout)]
+            if use_attention:
+                model += [AttentionBlock(input_nc, enable_resolutions=[16])]
+            self.up = nn.Sequential(*model)
         else:
             model = [ResnetBlock(input_nc, emb_nc, 3, use_dropout)]
             if use_attention:
-                model += [AttentionBlock(input_nc)]
+                model += [AttentionBlock(input_nc, enable_resolutions=[16])]
             model += [
                 nn.BatchNorm2d(num_features=input_nc),
                 nn.ReLU(),
@@ -86,7 +93,7 @@ class UnetSkipModule(nn.Module):
             self.down = nn.Sequential(*model)
             model = [ResnetBlock(inner_nc * 2, emb_nc, 3, use_dropout)]
             if use_attention:
-                model += [AttentionBlock(input_nc)]
+                model += [AttentionBlock(inner_nc * 2, enable_resolutions=[16])]
             model += [
                 nn.BatchNorm2d(num_features=inner_nc * 2),
                 nn.ReLU(),
@@ -154,32 +161,42 @@ class ResnetBlock(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    def __init__(self, input_nc):
+    def __init__(self, input_nc, enable_resolutions=[]):
         super(AttentionBlock, self).__init__()
         self.query = nn.Sequential(
-            nn.BatchNorm1d(num_features=input_nc),
-            nn.Linear(input_nc, input_nc)
+            nn.BatchNorm2d(num_features=input_nc),
+            TensorLinear(input_nc, input_nc)
         )
         self.key = nn.Sequential(
-            nn.BatchNorm1d(num_features=input_nc),
-            nn.Linear(input_nc, input_nc)
+            nn.BatchNorm2d(num_features=input_nc),
+            TensorLinear(input_nc, input_nc)
         )
         self.value = nn.Sequential(
-            nn.BatchNorm1d(num_features=input_nc),
-            nn.Linear(input_nc, input_nc)
+            nn.BatchNorm2d(num_features=input_nc),
+            TensorLinear(input_nc, input_nc)
         )
-        self.last_layer = nn.Linear(input_nc, input_nc)
+        self.last_layer = TensorLinear(input_nc, input_nc)
+        self.enable_resolutions = enable_resolutions
 
-    def forward(self, input:dict):
-        x = input['x']
+    def forward(self, input):
+        x = input
         B, C, H, W = x.size()
+        if len(self.enable_resolutions)>0 and H not in self.enable_resolutions:
+            return x
         q = self.query(x)
         v = self.value(x)
         k = self.key(x)
-        w = torch.einsum('bchw,bcHW->bhwHW', q, k) * (int(C) ** (-0.5)).view(B, H, W, H * W)
+        w = (torch.einsum('bchw,bcix->bhwix', q, k) * (int(C) ** (-0.5))).view(B, H, W, H * W)
         w = F.softmax(w).view(B, H, W, H, W)
-        h = torch.einsum('bhwHW,bcHW->bchw', w, v)
+        h = torch.einsum('bhwix,bcix->bchw', w, v)
         return x + self.last_layer(h)
+
+
+class TensorLinear(nn.Linear):
+    def forward(self, input):
+        x = input
+        y = torch.tensordot(x.permute(0,2,3,1), self.weight, dims=1) + self.bias
+        return y.permute(0,3,1,2)
 
 
 class ModuleWrap(nn.Module):

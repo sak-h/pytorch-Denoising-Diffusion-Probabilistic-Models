@@ -66,7 +66,7 @@ class DDPModel:
         model = []
         if opt.block_size != 1:
             model += [utils.SpaceToDepth(opt.block_size)]
-        model += [unet.Unet(opt.input_nc, opt.input_nc, num_middles=1, ngf=opt.ngf, use_dropout=opt.dropout, device=self.device)]
+        model += [unet.Unet(opt.input_nc, opt.input_nc, num_middles=1, ngf=opt.ngf, use_dropout=opt.dropout, use_attention=opt.attention, device=self.device)]
         if opt.block_size != 1:
             model += [utils.SpaceToDepth(opt.block_size)]
         self.denoise_model = utils.init_net(nn.Sequential(*model), opt.init_type, opt.init_gain, opt.gpu_ids)
