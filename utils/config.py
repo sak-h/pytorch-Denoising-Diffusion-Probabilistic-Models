@@ -16,6 +16,8 @@ class Config:
         self.parser.add_argument('--checkpoints_dir', type=str, default='outputs/checkpoints', help='Checkpoints Directory')
         self.parser.add_argument('--input_nc', type=int, default=3, help='# of input image channels: 3 for RGB and 1 for grayscale')
         self.parser.add_argument('--ngf', type=int, default=64, help='# of filters in the first conv layer')
+        self.parser.add_argument('--norm', type=str, default='batch', help='type of normalization layer [batch | groupN]')
+        self.parser.add_argument('--activation', type=str, default='relu', help='type of activation layer [relu | swish]')
         self.parser.add_argument('--init_type', type=str, default='normal', help='network initialization [normal | xavier | kaiming | orthogonal]')
         self.parser.add_argument('--init_gain', type=float, default=0.02, help='scaling factor for normal, xavier and orthogonal.')
         self.parser.add_argument('--dropout', action='store_true', help='use dropout')
@@ -35,7 +37,7 @@ class Config:
         self.parser.add_argument('--beta_start', type=int, default=0.0001, help='start beta value')
         self.parser.add_argument('--beta_end', type=int, default=0.02, help='end beta value')
         self.parser.add_argument('--num_timesteps', type=int, default=1000, help='# of timesteps')
-        self.parser.add_argument('--loss_type', type=str, default='noisepred', help='loss prediction policy. [noisepred]')
+        self.parser.add_argument('--loss_type', type=str, default='noisepred_mse', help='loss prediction policy. [noisepred_mse | noisepred_l1]')
         self.parser.add_argument('--print_freq', type=int, default=100, help='frequency of showing training results on screen')
         self.parser.add_argument('--verbose', action='store_true', help='verbose mode')
 

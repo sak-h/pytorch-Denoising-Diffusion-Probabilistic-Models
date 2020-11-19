@@ -2,10 +2,30 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+import utils.utils as utils
+
+
+def get_norm_class(normtype: str, num_features: int):
+    if 'group' in normtype:
+        ngroups = int(normtype.replace('group',''))
+        return nn.GroupNorm(num_groups=ngroups, num_channels=num_features)
+    elif normtype == 'batch':
+        return nn.BatchNorm2d(num_features=num_features)
+    else:
+        raise NotImplementedError(normtype)
+
+
+def get_activation_class(activation_type: str):
+    if activation_type=='relu':
+        return nn.ReLU()
+    elif activation_type == 'swish':
+        return utils.Swish()
+    else:
+        raise NotImplementedError(activation_type)
 
 
 class Unet(nn.Module):
-    def __init__(self, input_nc, output_nc, num_middles=2, ngf=64, use_dropout=False, use_attention=False, device='cpu'):
+    def __init__(self, input_nc: int, output_nc: int, num_middles: int = 2, ngf: int = 64, norm: str = 'batch', activation: str = 'relu', use_dropout: bool = False, use_attention: bool = False, device: str = 'cpu'):
         """Create a Unet Module
 
         Parameters:
@@ -19,19 +39,19 @@ class Unet(nn.Module):
         """
         super(Unet, self).__init__()
         # construct unet structure
-        unet_block = UnetSkipModule(ngf * 8, ngf * 8, ngf * 4, input_nc=None, submodule=None, innermost=True, use_dropout=use_dropout, use_attention=use_attention)  # add the innermost layer
+        unet_block = UnetSkipModule(ngf * 8, ngf * 8, ngf * 4, input_nc=None, norm=norm, activation=activation, submodule=None, innermost=True, use_dropout=use_dropout, use_attention=use_attention)  # add the innermost layer
         for i in range(num_middles):          # add intermediate layers with ngf * 8 filters
-            unet_block = UnetSkipModule(ngf * 8, ngf * 8, ngf * 4, input_nc=None, submodule=unet_block, use_dropout=use_dropout, use_attention=use_attention)
+            unet_block = UnetSkipModule(ngf * 8, ngf * 8, ngf * 4, input_nc=None, norm=norm, activation=activation, submodule=unet_block, use_dropout=use_dropout, use_attention=use_attention)
         # gradually reduce the number of filters from ngf * 8 to ngf
-        unet_block = UnetSkipModule(ngf * 4, ngf * 8, ngf * 4, input_nc=None, submodule=unet_block, use_dropout=use_dropout, use_attention=use_attention)
-        unet_block = UnetSkipModule(ngf * 2, ngf * 4, ngf * 4, input_nc=None, submodule=unet_block, use_dropout=use_dropout, use_attention=use_attention)
-        unet_block = UnetSkipModule(ngf, ngf * 2, ngf * 4, input_nc=None, submodule=unet_block, use_dropout=use_dropout, use_attention=use_attention)
-        self.model = UnetSkipModule(output_nc, ngf, ngf * 4, input_nc=input_nc, submodule=unet_block, outermost=True, use_dropout=use_dropout)  # add the outermost layer
+        unet_block = UnetSkipModule(ngf * 4, ngf * 8, ngf * 4, input_nc=None, norm=norm, activation=activation, submodule=unet_block, use_dropout=use_dropout, use_attention=use_attention)
+        unet_block = UnetSkipModule(ngf * 2, ngf * 4, ngf * 4, input_nc=None, norm=norm, activation=activation, submodule=unet_block, use_dropout=use_dropout, use_attention=use_attention)
+        unet_block = UnetSkipModule(ngf, ngf * 2, ngf * 4, input_nc=None, norm=norm, activation=activation, submodule=unet_block, use_dropout=use_dropout, use_attention=use_attention)
+        self.model = UnetSkipModule(output_nc, ngf, ngf * 4, input_nc=input_nc, norm=norm, activation=activation, submodule=unet_block, outermost=True, use_dropout=use_dropout)  # add the outermost layer
 
         self.embedding_weight = torch.exp(torch.arange(0, ngf//2) * -(math.log(10000) / (ngf//2 - 1))).to(device)
         self.embedding = nn.Sequential(
             nn.Linear(ngf, ngf * 4),
-            nn.ReLU(),
+            get_activation_class(activation_type=activation),
             nn.Linear(ngf * 4, ngf * 4)
             )
 
@@ -44,7 +64,7 @@ class Unet(nn.Module):
 
 
 class UnetSkipModule(nn.Module):
-    def __init__(self, outer_nc, inner_nc, emb_nc, input_nc=None, submodule=None, outermost=False, innermost=False, use_attention=False, use_dropout=False):
+    def __init__(self, outer_nc: int, inner_nc: int, emb_nc: int, input_nc = None, norm: str = 'batch', activation: str = 'relu', submodule = None, outermost: bool = False, innermost: bool = False, use_attention: bool = False, use_dropout: bool = False):
         """Construct a Unet submodule with skip connections.
 
         Parameters:
@@ -63,40 +83,40 @@ class UnetSkipModule(nn.Module):
         if outermost:
             self.down = ModuleWrap(nn.Conv2d(input_nc, inner_nc, kernel_size=3, stride=1, padding=1, padding_mode='reflect'))
             self.up = ModuleWrap(nn.Sequential(
-                nn.BatchNorm2d(num_features=inner_nc * 2),
-                nn.ReLU(),
+                get_norm_class(normtype=norm, num_features=inner_nc * 2),
+                get_activation_class(activation_type=activation),
                 nn.ConvTranspose2d(inner_nc * 2, outer_nc, kernel_size=3, stride=1, padding=1, padding_mode='zeros')
                 ))
         elif innermost:
-            model = [ResnetBlock(input_nc, emb_nc, 3, use_dropout)]
+            model = [ResnetBlock(input_nc, emb_nc, 3, norm=norm, activation=activation, use_dropout=use_dropout)]
             if use_attention:
                 model += [AttentionBlock(input_nc, enable_resolutions=[16])]
             model += [
-                nn.BatchNorm2d(num_features=input_nc),
-                nn.ReLU(),
+                get_norm_class(normtype=norm, num_features=input_nc),
+                get_activation_class(activation_type=activation),
                 nn.Conv2d(input_nc, inner_nc, kernel_size=3, stride=1, padding=1, padding_mode='reflect')
                 ]
             self.down = nn.Sequential(*model)
-            model = [ResnetBlock(inner_nc, emb_nc, 3, use_dropout)]
+            model = [ResnetBlock(inner_nc, emb_nc, 3, norm=norm, activation=activation, use_dropout=use_dropout)]
             if use_attention:
                 model += [AttentionBlock(input_nc, enable_resolutions=[16])]
             self.up = nn.Sequential(*model)
         else:
-            model = [ResnetBlock(input_nc, emb_nc, 3, use_dropout)]
+            model = [ResnetBlock(input_nc, emb_nc, 3, norm=norm, activation=activation, use_dropout=use_dropout)]
             if use_attention:
                 model += [AttentionBlock(input_nc, enable_resolutions=[16])]
             model += [
-                nn.BatchNorm2d(num_features=input_nc),
-                nn.ReLU(),
+                get_norm_class(normtype=norm, num_features=input_nc),
+                get_activation_class(activation_type=activation),
                 nn.Conv2d(input_nc, inner_nc, kernel_size=4, stride=2, padding=1, padding_mode='reflect')    
                 ]
             self.down = nn.Sequential(*model)
-            model = [ResnetBlock(inner_nc * 2, emb_nc, 3, use_dropout)]
+            model = [ResnetBlock(inner_nc * 2, emb_nc, 3, norm=norm, activation=activation, use_dropout=use_dropout)]
             if use_attention:
                 model += [AttentionBlock(inner_nc * 2, enable_resolutions=[16])]
             model += [
-                nn.BatchNorm2d(num_features=inner_nc * 2),
-                nn.ReLU(),
+                get_norm_class(normtype=norm, num_features=inner_nc * 2),
+                get_activation_class(activation_type=activation),
                 nn.ConvTranspose2d(inner_nc * 2, outer_nc, kernel_size=4, stride=2, padding=1, padding_mode='zeros')
                 ]
             self.up = nn.Sequential(*model)
@@ -118,7 +138,7 @@ class UnetSkipModule(nn.Module):
 
 
 class ResnetBlock(nn.Module):
-    def __init__(self, input_nc, emb_nc, kernel_size=3, use_dropout=False):
+    def __init__(self, input_nc: int, emb_nc: int, kernel_size: int = 3, norm: str = 'batch', activation: str = 'relu', use_dropout: bool = False):
         """Construct a Unet submodule with skip connections.
 
         Parameters:
@@ -132,20 +152,20 @@ class ResnetBlock(nn.Module):
         """
         super(ResnetBlock, self).__init__()
         self.first_layer = nn.Sequential(
-            nn.BatchNorm2d(num_features=input_nc),
-            nn.ReLU(),
+            get_norm_class(normtype=norm, num_features=input_nc),
+            get_activation_class(activation_type=activation),
             nn.Conv2d(input_nc, input_nc, kernel_size=kernel_size, padding=((kernel_size-1)//2), padding_mode='reflect')
             )
         model = [
-            nn.BatchNorm2d(num_features=input_nc),
-            nn.ReLU()
+            get_norm_class(normtype=norm, num_features=input_nc),
+            get_activation_class(activation_type=activation)
             ]
         if use_dropout:
             model += [nn.Dropout(0.5)]
         model += [nn.Conv2d(input_nc, input_nc, kernel_size=kernel_size, padding=((kernel_size-1)//2), padding_mode='reflect')]
         self.second_layer = nn.Sequential(*model)
         self.embedding = nn.Sequential(
-                nn.ReLU(),
+                get_activation_class(activation_type=activation),
                 nn.Linear(emb_nc, input_nc)
             )
     
@@ -161,18 +181,18 @@ class ResnetBlock(nn.Module):
 
 
 class AttentionBlock(nn.Module):
-    def __init__(self, input_nc, enable_resolutions=[]):
+    def __init__(self, input_nc: int, norm: str = 'batch', enable_resolutions=[]):
         super(AttentionBlock, self).__init__()
         self.query = nn.Sequential(
-            nn.BatchNorm2d(num_features=input_nc),
+            get_norm_class(normtype=norm, num_features=input_nc),
             TensorLinear(input_nc, input_nc)
         )
         self.key = nn.Sequential(
-            nn.BatchNorm2d(num_features=input_nc),
+            get_norm_class(normtype=norm, num_features=input_nc),
             TensorLinear(input_nc, input_nc)
         )
         self.value = nn.Sequential(
-            nn.BatchNorm2d(num_features=input_nc),
+            get_norm_class(normtype=norm, num_features=input_nc),
             TensorLinear(input_nc, input_nc)
         )
         self.last_layer = TensorLinear(input_nc, input_nc)

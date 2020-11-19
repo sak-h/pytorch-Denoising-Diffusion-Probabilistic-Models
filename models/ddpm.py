@@ -29,11 +29,37 @@ class DDPModel:
             os.makedirs(self.save_dir)
             print('Directory created: %s' % self.save_dir)
 
-        betas = self.get_beta_schedule(opt.beta_schedule, opt.beta_start, opt.beta_end, opt.num_timesteps)
-        alphas = 1. - betas
-        alphas_cumprod = np.cumprod(alphas, axis=0)
-        alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
+        # define schedule
+        if opt.beta_schedule == 'cosine':
+            """ Cosine Schedule
+                @inproceedings{
+                    anonymous2021improved,
+                    title={Improved Denoising Diffusion Probabilistic Models},
+                    author={Anonymous},
+                    booktitle={Submitted to International Conference on Learning Representations},
+                    year={2021},
+                    url={https://openreview.net/forum?id=-NEXDKk8gZ},
+                    note={under review}
+                }
+            """
+            s = 0.008
+            x = np.linspace(0, opt.num_timesteps-1, opt.num_timesteps-1)
+            alphas_cumprod = np.cos(((x / opt.num_timesteps) + s) / (1 + s) * np.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            alphas_cumprod[alphas_cumprod>0.999999] = 0.999999
+            alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
+            betas = np.clip( 1 - (alphas_cumprod / alphas_cumprod_prev), a_min = 0, a_max = 0.999)
+            alphas = 1. - betas
+        else:
+            betas = self.get_beta_schedule(opt.beta_schedule, opt.beta_start, opt.beta_end, opt.num_timesteps)
+            alphas = 1. - betas
+            alphas_cumprod = np.cumprod(alphas, axis=0)
+            alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
         assert alphas_cumprod_prev.shape == betas.shape
+
+        assert isinstance(betas, np.ndarray) and (betas >= 0).all() and (betas <= 1).all()
+        timesteps, = betas.shape
+        self.num_timesteps = int(timesteps)
 
         self.betas = torch.tensor(betas)
         self.alphas_cumprod = torch.tensor(alphas_cumprod)
@@ -55,18 +81,11 @@ class DDPModel:
         self.posterior_mean_coef1 = torch.tensor(betas * np.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod), dtype=torch.float32, device=self.device)
         self.posterior_mean_coef2 = torch.tensor((1. - alphas_cumprod_prev) * np.sqrt(alphas) / (1. - alphas_cumprod), dtype=torch.float32, device=self.device)
 
-        assert isinstance(betas, np.ndarray) and (betas > 0).all() and (betas <= 1).all()
-        timesteps, = betas.shape
-        self.num_timesteps = int(timesteps)
-
-        self.loss_criteria = nn.MSELoss(reduction='none')
-        self.loss_type = opt.loss_type
-
         # setup denoise model
         model = []
         if opt.block_size != 1:
             model += [utils.SpaceToDepth(opt.block_size)]
-        model += [unet.Unet(opt.input_nc, opt.input_nc, num_middles=1, ngf=opt.ngf, use_dropout=opt.dropout, use_attention=opt.attention, device=self.device)]
+        model += [unet.Unet(opt.input_nc, opt.input_nc, num_middles=1, ngf=opt.ngf, norm=opt.norm, activation=opt.activation, use_dropout=opt.dropout, use_attention=opt.attention, device=self.device)]
         if opt.block_size != 1:
             model += [utils.SpaceToDepth(opt.block_size)]
         self.denoise_model = utils.init_net(nn.Sequential(*model), opt.init_type, opt.init_gain, opt.gpu_ids)
@@ -74,12 +93,29 @@ class DDPModel:
         if opt.phase == 'train':
             # setup optimizer, visualizer, and learning rate scheduler
             self.optimizer = torch.optim.Adam(self.denoise_model.parameters(), lr=opt.lr, betas=(opt.beta1, 0.999))
+            if 'mse' in opt.loss_type:
+                self.loss_criteria = nn.MSELoss()
+            elif 'l1' in opt.loss_type:
+                self.loss_criteria = nn.L1Loss()
+            else:
+                raise NotImplementedError(opt.loss_type)
+            # set prediction function
+            if 'noisepred' in opt.loss_type:
+                self.pred_fn = DDPModel._noisepred
+            else:
+                raise NotImplementedError(opt.loss_type)
+            self.loss_type = opt.loss_type
             self.visualizer = visualizer.Visualizer(opt)
             self.scheduler = utils.get_scheduler(self.optimizer, opt)
             self.lr_policy = opt.lr_policy
         else:
             self.image_size = (opt.batch_size, opt.input_nc, opt.load_size, opt.load_size)
             self.denoise_model.train(False)
+            # set prediction function
+            if 'noisepred' in opt.loss_type:
+                self.pred_fn = self.predict_start_from_noise
+            else:
+                raise NotImplementedError(opt.loss_type)
 
         if opt.phase == 'interpolate':
             self.mix_rate = opt.mix_rate
@@ -173,9 +209,7 @@ class DDPModel:
         B = self.images.size(0)
         self.timestep = torch.randint(self.num_timesteps, size=tuple([B]), dtype=torch.long, device=self.device)
         self.x_start = self.images
-        losses = self.p_losses(x_start=self.x_start, t=self.timestep)
-        assert losses.size(0) == self.timestep.size(0) == B
-        self.losses = losses.mean()
+        self.losses = self.p_losses(x_start=self.x_start, t=self.timestep)
         self.optimizer.zero_grad()
         self.losses.backward()
         self.optimizer.step()
@@ -232,6 +266,11 @@ class DDPModel:
         noise = lambda: noise_fn(shape, dtype=dtype)
         return repeat_noise() if repeat else noise()
 
+    @staticmethod
+    def _noisepred(x_start, noise, x_recon, loss_fn):
+        # predict the noise instead of x_start. seems to be weighted naturally like SNR
+        return loss_fn(noise, x_recon)
+
     def q_sample(self, x_start, t, noise=None):
         """Diffuse the data (t == 0 means diffused for 1 step)
 
@@ -266,12 +305,7 @@ class DDPModel:
         self.x_recon = self.denoise_model({'x': self.x_noisy, 't': t})
         assert self.x_noisy.size() == x_start.size()
         assert self.x_recon.size() == x_start.size()
-        if self.loss_type == 'noisepred':
-            # predict the noise instead of x_start. seems to be weighted naturally like SNR
-            losses = self.loss_criteria(self.noise, self.x_recon).view(B, -1).mean(dim=1)
-        else:
-            raise NotImplementedError(loss_type)
-        assert losses.dim() == 1 and losses.size(0) == B
+        losses = self.pred_fn(x_start=self.x_start, noise=self.noise, x_recon=self.x_recon, loss_fn=self.loss_criteria)
         return losses
 
     def p_sample_loop(self, shape, noise_fn=torch.randn):
@@ -309,10 +343,7 @@ class DDPModel:
         return model_mean + nonzero_mask * torch.exp(0.5 * model_log_variance) * noise
 
     def p_mean_variance(self, x, t, clip_denoised: bool):
-        if self.loss_type == 'noisepred':
-            x_recon = self.predict_start_from_noise(x, t=t, noise=self.denoise_model({'x': x, 't': t}))
-        else:
-            raise NotImplementedError(self.loss_type)
+        x_recon = self.pred_fn(x, t=t, noise=self.denoise_model({'x': x, 't': t}))
 
         if clip_denoised:
             x_recon[x_recon>1] = 1
